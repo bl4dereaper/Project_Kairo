@@ -1,0 +1,382 @@
+"""
+dslr_controller.py — Full-spectrum converted DSLR/mirrorless camera support
+for Canon, Nikon, Fujifilm (PTP bodies via libgphoto2).
+
+Backend: libgphoto2 (python-gphoto2 bindings)
+- Unified backend for all three target vendors
+- Capture-to-RAM avoids SD card wear and file-download overhead
+- Linear RAW Bayer extraction via rawpy/LibRaw for spectral fidelity
+- Three-plane output (R, G, B Bayer sites as separate channels per band)
+
+Dependencies (add to requirements.txt):
+    gphoto2   # python-gphoto2 bindings, requires system libgphoto2 >= 2.5
+    rawpy     # LibRaw wrapper for DNG/NEF/CR2/CR3/RAF decoding
+"""
+
+import logging
+import time
+from fractions import Fraction
+from typing import List, Optional
+
+import cv2
+import numpy as np
+
+try:
+    import gphoto2 as gp
+    GPHOTO_AVAILABLE = True
+except ImportError:
+    GPHOTO_AVAILABLE = False
+
+try:
+    import rawpy
+    RAWPY_AVAILABLE = True
+except ImportError:
+    RAWPY_AVAILABLE = False
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from controllers.camera_interface import CameraInterface
+from rig_config import RigConfig
+
+logger = logging.getLogger(__name__)
+
+
+class DSLRController(CameraInterface):
+    """
+    Controls a tethered consumer camera (converted or stock) over PTP.
+
+    Designed for full-spectrum converted bodies used in multispectral
+    capture: exposure is set via the camera's PTP config tree, images are
+    captured directly to RAM, and RAW files are decoded to linear Bayer
+    data so downstream cube creation receives unprocessed sensor values.
+
+    Output shape: (H, W, 3) where plane 0 = Red Bayer sites,
+    plane 1 = Green (both diagonals averaged), plane 2 = Blue Bayer sites.
+    """
+
+    # --------------------------------------------------------------- #
+    #  Construction                                                     #
+    # --------------------------------------------------------------- #
+
+    def __init__(self, iso: int = 100, aperture: str = "f/8",
+                 use_raw: bool = True, mono_channel: str = "all"):
+        """
+        Args:
+            iso: fixed ISO for capture sequence (never auto-advance)
+            aperture: PTP string, e.g. "f/8" or "5.6" (Nikon)
+            use_raw: True extracts linear Bayer; False decodes JPEG
+            mono_channel: "all" (default, three-plane Bayer) or
+                        "red" | "green" | "blue" for 2D monochrome output
+        """
+        # Validate environment early so failures surface at construction,
+        # not mid-capture-session
+        if not GPHOTO_AVAILABLE:
+            raise RuntimeError(
+                "python-gphoto2 is not installed. "
+                "Install libgphoto2 and run: pip install gphoto2")
+        if use_raw and not RAWPY_AVAILABLE:
+            raise RuntimeError("rawpy is required for RAW capture mode")
+
+        self.camera = None          # gp.Camera, set in initialize_camera()
+        self.context = None        # gp.Context, set in initialize_camera()
+        self.iso = iso
+        self.aperture = aperture
+        self.use_raw = use_raw
+        self.mono_channel = mono_channel
+
+        # Populated during initialize; shutter-speed choices differ per body
+        self._shutter_choices: List[str] = []
+        self._cached_exposure_key: Optional[str] = None  # skip redundant writes
+
+        self.exposure: Optional[float] = None
+        self.ORIGINAL_EXPOSURE: Optional[float] = None
+        self.sharpness: float = 0.0
+        self._rig_config: Optional[RigConfig] = None
+
+        # Runtime stats
+        self._frames_captured = 0
+        self._avg_capture_ms = 0.0
+
+    # --------------------------------------------------------------- #
+    #  Rig config injection                                              #
+    # --------------------------------------------------------------- #
+
+    def set_rig_config(self, config: RigConfig) -> None:
+        """Inject an externalized rig configuration (bands + exposures)."""
+        self._rig_config = config
+
+    # --------------------------------------------------------------- #
+    #  CameraInterface contract                                          #
+    # --------------------------------------------------------------- #
+
+    def initialize_camera(self) -> None:
+        """Detect and initialize the first PTP-visible camera."""
+        self.context = gp.Context()
+        self.camera = gp.Camera()
+
+        ports = self._list_ports()
+        if not ports:
+            raise RuntimeError(
+                "No PTP cameras detected. Check USB connection and ensure "
+                "the camera is in the correct tethering/playback mode.")
+
+        logger.info("Initializing camera on port: %s", ports[0])
+        self.camera.init(self.context)
+
+        # ---- Critical performance settings ------------------------- #
+        # Capture into host RAM instead of the SD card: skips the
+        # camera->card write AND the subsequent download handshake
+        self._set_config_simple('capturetarget', 'Internal RAM')
+        # Kill the focus beep: beeps cost measurable milliseconds per shot
+        self._safe_set('audio', 0, warn=False)
+
+        # Pre-fetch available shutter speeds ONCE; traversing the PTP
+        # config tree costs 50-300 ms per query
+        self._shutter_choices = (
+            self._get_config_choices('shutterspeed2') or
+            self._get_config_choices('shutterspeed')
+        )
+        if not self._shutter_choices:
+            raise RuntimeError(
+                "Could not enumerate shutter speeds — unsupported body?")
+
+        self.apply_static_settings()
+        logger.info("Camera ready. %d shutter speeds available.",
+                    len(self._shutter_choices))
+
+    def uninitialize_camera(self) -> None:
+        """Release the camera cleanly; safe to call multiple times."""
+        if self.camera is not None:
+            try:
+                self.camera.exit(self.context)
+            finally:
+                self.camera = None
+                self.context = None
+                self._cached_exposure_key = None
+
+    def capture(self) -> tuple:
+        """Capture at the currently saved exposure."""
+        if self.exposure is None:
+            raise RuntimeError(
+                "No exposure saved — call save_exposure() first")
+        return self._do_capture(self.exposure)
+
+    def capture_at_exposure(self, exposure) -> tuple:
+        """Set exposure (seconds, float) and capture in one atomic sequence."""
+        return self._do_capture(float(exposure))
+
+    def capture_band(self, band_index: int) -> tuple:
+        """Capture one band of the configured sequence at its tuned exposure."""
+        if self._rig_config is None:
+            raise RuntimeError(
+                "No RigConfig injected — call set_rig_config() first")
+        return self.capture_at_exposure(
+            self._rig_config.exposure_for(band_index))
+
+    def save_exposure(self, exposure) -> None:
+        """Save exposure for future capture() calls."""
+        self.exposure = float(exposure)
+        if self.ORIGINAL_EXPOSURE is None:
+            self.ORIGINAL_EXPOSURE = float(exposure)
+
+    def reset_exposure(self):
+        """Restore to originally saved exposure."""
+        if self.ORIGINAL_EXPOSURE is not None:
+            self.exposure = self.ORIGINAL_EXPOSURE
+
+    # --------------------------------------------------------------- #
+    #  Core capture path                                                 #
+    # --------------------------------------------------------------- #
+
+    def _do_capture(self, exposure_sec: float) -> tuple:
+        """
+        Exposure -> shutter-speed lookup -> PTP trigger -> decode -> ndarray.
+
+        Returns a tuple consistent with the other controllers' capture():
+        (numpy_image,) — adjust the unpack downstream to match legacy
+        Blackfly/Pixelink return signatures.
+        """
+        shutter_str = self._nearest_shutter(exposure_sec)
+        t0 = time.perf_counter()
+
+        # Config write is skipped when unchanged — the biggest single win
+        # for band sequences where consecutive exposures may repeat
+        if shutter_str != self._cached_exposure_key:
+            self._set_config_simple('shutterspeed', shutter_str)
+            self._cached_exposure_key = shutter_str
+
+        # PTP capture to RAM
+        file_path = gp.check_result(
+            self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context))
+        t_capture = time.perf_counter() - t0
+
+        # Pull the full file bytes from memory
+        img_data = gp.check_result(file_path.get_data_and_size())
+
+        image = self._decode(img_data)
+        t_total = time.perf_counter() - t0
+
+        # Running stats: exponential moving average, no growing history
+        self._frames_captured += 1
+        self._avg_capture_ms = 0.9 * self._avg_capture_ms \
+            + 0.1 * (t_total * 1000)
+
+        logger.debug("Captured %s: trigger %.2fs, total %.2fs, avg %.1fms",
+                     shutter_str, t_capture, t_total, self._avg_capture_ms)
+
+        # Sharpness metric mirrors base-class contract (manual focus —
+        # autofocus is disabled for tethered spectral work)
+        self.sharpness = self._measure_sharpness(image)
+        return (image,)
+
+    # --------------------------------------------------------------- #
+    #  Decoding & spectral channel handling                             #
+    # --------------------------------------------------------------- #
+
+    def _decode(self, file_bytes: bytes) -> np.ndarray:
+        """
+        Convert captured file bytes to a numpy array.
+
+        RAW mode (use_raw=True): extract the native Bayer mosaic WITHOUT
+        demosaicing, white-balance, or gamma — critical for spectral work
+        since camera processing destroys the linear reflectance signal.
+        Default output is the full three-plane stack; mono modes isolate
+        a single channel for backward compatibility.
+
+        JPEG mode (use_raw=False): cv2's SIMD decode is the fastest
+        pure-Python path.
+        """
+        if self.use_raw:
+            with rawpy.imread(file_bytes) as raw:
+                bayer = raw.raw_image_visible.copy()  # linear sensor data
+
+            # Build all three planes up-front (RGGB assumed — verify per
+            # body; Fuji X-Trans differs and needs its own handler)
+            planes = {
+                'red':   bayer[0::2, 0::2],
+                'green': (bayer[0::2, 1::2].astype(np.float32) +
+                          bayer[1::2, 0::2]).astype(bayer.dtype) / 2,
+                'blue':  bayer[1::2, 1::2],
+            }
+
+            if self.mono_channel == "all":
+                # Three-plane output: (H, W, 3)
+                return np.stack([planes['red'], planes['green'],
+                                 planes['blue']], axis=-1)
+
+            if self.mono_channel not in planes:
+                raise ValueError(
+                    f"Unknown mono_channel '{self.mono_channel}'")
+            return planes[self.mono_channel]
+
+        # JPEG fallback path
+        arr = np.frombuffer(file_bytes, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+
+    def _measure_sharpness(self, img: np.ndarray) -> float:
+        """Variance-of-Laplacian — O(n), SIMD-accelerated in OpenCV."""
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        lap = cv2.Laplacian(img, cv2.CV_64F)
+        return float(lap.var()) if img.size else 0.0
+
+    # --------------------------------------------------------------- #
+    #  Static camera settings                                            #
+    # --------------------------------------------------------------- #
+
+    def apply_static_settings(self) -> None:
+        """ISO, aperture, and vendor-neutral quality settings."""
+        self._safe_set('iso', self.iso)
+        self._safe_set('fnumber', self.aperture)
+        if self.use_raw:
+            # Request RAW wherever the body offers it (Nikon: rawmode,
+            # Canon: imageformat) — silent no-op on bodies that don't
+            self._safe_set('imageformat', 'RAW')
+            self._safe_set('capturemode', 'RAW')
+        self._safe_set('autofocusdrive', 0)  # never hunt during a cube run
+
+    # --------------------------------------------------------------- #
+    #  PTP config plumbing (cached, minimal-traversal)                   #
+    # --------------------------------------------------------------- #
+
+    def _set_config_simple(self, name: str, value) -> None:
+        """Write one config leaf. Raises on hard failure."""
+        config = gp.check_result(self.camera.get_config(self.context))
+        widget = gp.check_result(config.get_child_by_name(name))
+        widget_type = widget.get_type()
+        if widget_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO):
+            widget.set_choice(str(value))
+        else:
+            widget.set_value(value)
+        gp.check_result(self.camera.set_config(config, self.context))
+
+    def _safe_set(self, name: str, value, warn: bool = True) -> None:
+        """Config write that tolerates unsupported fields per vendor."""
+        try:
+            self._set_config_simple(name, value)
+        except Exception:
+            if warn:
+                logger.warning("Config '%s' not supported on this body; "
+                               "skipping (value=%r)", name, value)
+        # Any successful config write may invalidate the shutter cache
+        self._cached_exposure_key = None
+
+    def _get_config_choices(self, name: str) -> list:
+        """Enumerate the allowed values of a radio/menu widget."""
+        try:
+            config = gp.check_result(self.camera.get_config(self.context))
+            widget = gp.check_result(config.get_child_by_name(name))
+            if widget.get_type() not in (gp.GP_WIDGET_MENU,
+                                         gp.GP_WIDGET_RADIO):
+                return []
+            return [widget.get_choice(i)
+                    for i in range(widget.count_choices())]
+        except Exception:
+            return []
+
+    def _nearest_shutter(self, target_sec: float) -> str:
+        """
+        Map a float exposure to the closest body-supported shutter speed,
+        preferring longer-or-equal so a band is never underexposed.
+        """
+        def parse(s: str) -> float:
+            # Handles "1/250", "2.5", "30\"" style PTP strings
+            s = s.strip().rstrip('"').rstrip("'")
+            if '/' in s:
+                num, den = s.split('/')
+                return float(Fraction(int(num), int(den)))
+            return float(s)
+
+        best, best_err = None, float('inf')
+        for choice in self._shutter_choices:
+            try:
+                val = parse(choice)
+            except (ValueError, ZeroDivisionError):
+                continue
+            err = abs(val - target_sec)
+            if err < best_err:
+                best, best_err = choice, err
+        if best is None:
+            raise ValueError(f"No shutter speed near {target_sec}s")
+        return best
+
+    def _list_ports(self) -> list:
+        """Autodetect connected PTP cameras; return their port paths."""
+        detected = gp.check_result(
+            gp.gp_camera_autodetect(self.context))
+        return [cam[1] for cam in detected]
+
+    # --------------------------------------------------------------- #
+    #  Statistics                                                        #
+    # --------------------------------------------------------------- #
+
+    def get_stats(self) -> dict:
+        """Return capture statistics for diagnostics."""
+        return {
+            'frames_captured': self._frames_captured,
+            'avg_capture_ms': round(self._avg_capture_ms, 1),
+            'last_exposure_s': self.exposure,
+            'last_sharpness': self.sharpness,
+        }
