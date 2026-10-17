@@ -1,5 +1,5 @@
-# MISHA Capture Upgrade — Working Notes
-Repo: github.com/bl4dereaper/MISHA · Focus: DSLR/mirrorless camera support + streamlining
+# Project Kairo — Working Notes
+Repo: github.com/bl4dereaper/Project Kairo · Focus: DSLR/mirrorless camera support + streamlining
 
 
 ## System Overview
