@@ -3,21 +3,30 @@ import cv2
 from PyQt5.QtGui import QPixmap, QImage
 from scipy import ndimage
 import numpy as np
+from typing import Optional
 
 '''
 Camera Interface
-Written by Sai Keshav Sasanapuri and Cecelia Ahrens
+Written by Sai Keshav Sasanapuri and Cecelia Ahrens and Tom Shrieve
 '''
 class CameraInterface(ABC):
     ORIGINAL_EXPOSURE = None
     exposure = None
     sharpness = None
 
+    # DEPRECATED: kept only for backwards compatibility with the legacy
     exposureArray = [0.1, 0.1, 0.1, 0.09,
                      0.05, 0.045, 0.06, 0.072,
                      0.05, 0.18, 0.075, 0.08,
                      0.08, 0.1, 0.06, 0.15]
 
+    _rig_config: Optional["RigConfig"] = None
+
+    def set_rig_config(self, config) -> None:
+        """Inject an externalized rig configuration (bands + exposures)."""
+        self._rig_config = config
+
+    # ... existing abstract methods and helpers unchanged below ...
 
     @abstractmethod
     def initialize_camera(self) -> None:
